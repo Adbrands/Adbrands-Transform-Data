@@ -8,6 +8,7 @@ import re
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime
+import time
 
 def update_company_map_if_needed(master, company_map_df, credentials_file, spreadsheet_url, batch_size=50, max_writes_per_minute=90):
     """
