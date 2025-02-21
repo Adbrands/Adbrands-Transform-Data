@@ -9,41 +9,68 @@ import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime
 
-def update_company_map_if_needed(master, company_map_df, credentials_file, spreadsheet_url):
+def update_company_map_if_needed(master, company_map_df, credentials_file, spreadsheet_url, batch_size=50, max_writes_per_minute=90):
     """
-    Update the company map sheet with new 'OLD BRAND NAME', 'Company', and 'Brand' values
-    if they don't exist in the company map sheet.
+    Efficiently update the company map sheet by batching updates, handling API limits per minute, and retrying when needed.
     """
 
     master['Company'] = master['Company'].replace('', np.nan)
     master['Brand'] = master['Brand'].replace('', np.nan)
+    
+    # Find new unmatched companies
     unmatched_companies = master[['OLD BRAND NAME', 'Company', 'Brand']].drop_duplicates()
     unmatched_companies = unmatched_companies[~unmatched_companies['OLD BRAND NAME'].isin(company_map_df['OLD BRAND NAME'])]
 
-    if not unmatched_companies.empty:
-        st.info("**New Company Entries Found:**")
-        st.write(f"- {', '.join(unmatched_companies['OLD BRAND NAME'])}")
-
-        unmatched_companies['Company'] = unmatched_companies['Company'].fillna('Unknown')
-        unmatched_companies['Brand'] = unmatched_companies['Brand'].fillna('Unknown')
-
-        SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-        credentials = Credentials.from_service_account_file(credentials_file, scopes=SCOPES)
-        client = gspread.authorize(credentials)
-        sheet = client.open_by_url(spreadsheet_url).sheet1
-
-        for _, row in unmatched_companies.iterrows():
-            sheet.append_row([row['OLD BRAND NAME'], row['Company'], row['Brand']])
-
-        st.success("**New Company Entries Successfully Added to Google Sheet.**")
-        company_map_df = pd.concat([company_map_df, unmatched_companies], ignore_index=True)
-    else:
+    if unmatched_companies.empty:
         st.info("ℹ️ **No New Company Entries to Update.**")
+        return company_map_df
 
-    company_map_df = company_map_df.drop_duplicates(subset=['OLD BRAND NAME'])
+    st.info(f"**New Company Entries Found:** {len(unmatched_companies)} records")
+
+    # Fill missing values
+    unmatched_companies['Company'] = unmatched_companies['Company'].fillna('Unknown')
+    unmatched_companies['Brand'] = unmatched_companies['Brand'].fillna('Unknown')
+
+    # Google Sheets API setup
+    SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+    credentials = Credentials.from_service_account_file(credentials_file, scopes=SCOPES)
+    client = gspread.authorize(credentials)
+    sheet = client.open_by_url(spreadsheet_url).sheet1
+
+    # Convert data to a list format suitable for batch appending
+    rows_to_add = unmatched_companies[['OLD BRAND NAME', 'Company', 'Brand']].values.tolist()
+
+    # Batch processing with per-minute rate control
+    total_batches = (len(rows_to_add) // batch_size) + 1
+    writes_used = 0
+
+    for i in range(total_batches):
+        batch = rows_to_add[i * batch_size : (i + 1) * batch_size]
+        
+        if batch:
+            try:
+                sheet.append_rows(batch)
+                st.success(f"✅ **Batch {i+1}/{total_batches} Added Successfully!**")
+                writes_used += len(batch)
+
+                # If we reach the per-minute limit, pause for a minute
+                if writes_used >= max_writes_per_minute:
+                    st.warning(f"⏳ **API limit reached. Waiting 60 seconds before continuing...**")
+                    time.sleep(60)
+                    writes_used = 0  # Reset counter after waiting
+                
+            except Exception as e:
+                st.error(f"⚠️ **API Error: {e} - Retrying in 10 seconds...**")
+                time.sleep(10)
+                sheet.append_rows(batch)  # Retry once
+
+    # Update the local company map dataframe
+    company_map_df = pd.concat([company_map_df, unmatched_companies], ignore_index=True).drop_duplicates(subset=['OLD BRAND NAME'])
+    
+    st.success("🎉 **All New Company Entries Successfully Added!**")
     st.markdown("---")
     return company_map_df
-
+    
 def update_market_url_if_needed(new_data, market_url_df, credentials_file, spreadsheet_url):
     """
     Update the market_url sheet with new 'Territory' values if they don't exist,
